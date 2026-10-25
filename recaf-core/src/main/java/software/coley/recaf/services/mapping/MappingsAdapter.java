@@ -21,6 +21,7 @@ import software.coley.recaf.workspace.model.Workspace;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -153,7 +154,8 @@ public class MappingsAdapter implements Mappings {
 			if (ownerVertex == null || ownerVertex.isLibraryVertex())
 				continue;
 
-			// Skip enriching mappings on private or static methods, as they cannot be inherited.
+			// Skip enriching mappings on private, as they cannot be inherited.
+			// (static methods are also not inherited, but rather hidden)
 			ClassInfo ownerInfo = ownerVertex.getValue();
 			MethodMember ownerMethod = ownerInfo.getDeclaredMethod(methodName, explicitMapping.getDesc());
 			if (ownerMethod == null || ownerMethod.hasPrivateModifier() || ownerMethod.hasStaticModifier())
@@ -341,6 +343,19 @@ public class MappingsAdapter implements Mappings {
 		if (ownerMethod != null && (ownerMethod.hasPrivateModifier() || ownerMethod.hasStaticModifier()))
 			return null;
 
+		// Static methods are resolved through the owner's superclass chain. The nearest declaration hides
+		// any farther declarations, and static methods declared in interfaces are not inherited.
+		InheritanceVertex staticOwner = findNearestSuperclassMethod(ownerVertex, methodName, methodDesc);
+		if (staticOwner != null) {
+			ClassInfo staticOwnerInfo = staticOwner.getValue();
+			MethodMember staticOwnerMethod = staticOwnerInfo.getDeclaredMethod(methodName, methodDesc);
+			if (staticOwnerMethod != null && staticOwnerMethod.hasStaticModifier()) {
+				if (!isInheritedMethod(ownerInfo, ownerMethod, staticOwnerInfo, staticOwnerMethod))
+					return null;
+				return mappings.get(getMethodKey(staticOwner.getName(), methodName, methodDesc));
+			}
+		}
+
 		// Iterate through parents and find the first method match that is inherited by the owner class.
 		Iterator<InheritanceVertex> iterator = ownerVertex.allParents().iterator();
 		while (iterator.hasNext()) {
@@ -348,8 +363,10 @@ public class MappingsAdapter implements Mappings {
 			ClassInfo parentInfo = parentVertex.getValue();
 
 			// If the parent class doesn't have a method with the same name/desc, skip it.
+			// Static methods were handled above with their own resolution rules.
 			MethodMember parentMethod = parentInfo.getDeclaredMethod(methodName, methodDesc);
-			if (parentMethod == null || !isInheritedMethod(ownerInfo, ownerMethod, parentInfo, parentMethod))
+			if (parentMethod == null || parentMethod.hasStaticModifier()
+					|| !isInheritedMethod(ownerInfo, ownerMethod, parentInfo, parentMethod))
 				continue;
 
 			// Otherwise, we have a method that is inherited by the owner class, so we can check for a mapping on it.
@@ -360,6 +377,39 @@ public class MappingsAdapter implements Mappings {
 
 		// No mapping found in any parent class.
 		return null;
+	}
+
+	/**
+	 * Finds the nearest superclass of the given owner that declares a method matching the name/descriptor.
+	 * This mirrors the superclass portion of the JVM's method resolution.
+	 *
+	 * @param ownerVertex
+	 * 		Owner of the method reference.
+	 * @param methodName
+	 * 		Method name.
+	 * @param methodDesc
+	 * 		Method descriptor.
+	 *
+	 * @return Nearest superclass declaring the method, or {@code null} if none was found.
+	 */
+	@Nullable
+	private InheritanceVertex findNearestSuperclassMethod(@Nonnull InheritanceVertex ownerVertex,
+	                                                      @Nonnull String methodName,
+	                                                      @Nonnull String methodDesc) {
+		Set<String> visited = new HashSet<>();
+		InheritanceVertex current = ownerVertex;
+		visited.add(current.getName());
+		while (true) {
+			String superName = current.getValue().getSuperName();
+			if (superName == null || !visited.add(superName))
+				return null;
+			InheritanceVertex superVertex = inheritanceGraph.getVertex(superName);
+			if (superVertex == null)
+				return null;
+			if (superVertex.getValue().getDeclaredMethod(methodName, methodDesc) != null)
+				return superVertex;
+			current = superVertex;
+		}
 	}
 
 	/**
@@ -377,8 +427,16 @@ public class MappingsAdapter implements Mappings {
 	 */
 	protected static boolean isInheritedMethod(@Nonnull ClassInfo ownerInfo, @Nullable MethodMember ownerMethod,
 	                                           @Nonnull ClassInfo parentInfo, @Nonnull MethodMember parentMethod) {
-		// Cannot inherit private/static methods.
-		if (parentMethod.hasPrivateModifier() || parentMethod.hasStaticModifier())
+		// Cannot inherit private methods.
+		if (parentMethod.hasPrivateModifier())
+			return false;
+
+		// Static methods are inherited through the superclass chain, but not from interfaces.
+		// If the owner declares the method, static/instance declarations cannot be part of the same family.
+		boolean parentStatic = parentMethod.hasStaticModifier();
+		if (parentStatic && parentInfo.hasInterfaceModifier())
+			return false;
+		if (ownerMethod != null && ownerMethod.hasStaticModifier() != parentStatic)
 			return false;
 
 		// Package-private inheritance only works if the owners are in the same package.
@@ -415,6 +473,10 @@ public class MappingsAdapter implements Mappings {
 	                                            @Nonnull MethodMember familyMethod) {
 		if (ownerVertex == familyVertex)
 			return true;
+
+		// Static methods are hidden rather than overridden, so they do not share an override family.
+		if (ownerMethod.hasStaticModifier() != familyMethod.hasStaticModifier())
+			return false;
 
 		// Direct ancestry: one method is declared on a parent/interface path of the other.
 		if (familyVertex.isParentOf(ownerVertex))
