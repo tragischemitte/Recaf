@@ -3,6 +3,7 @@ package software.coley.recaf.services.deobfuscation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import software.coley.recaf.services.deobfuscation.transform.generic.DeadCodeRemovingTransformer;
 import software.coley.recaf.services.deobfuscation.transform.generic.DuplicateCatchMergingTransformer;
 import software.coley.recaf.services.deobfuscation.transform.generic.RedundantTryCatchRemovingTransformer;
 import software.coley.recaf.util.RegexUtil;
@@ -64,6 +65,29 @@ public class TryCatchDeobfuscationTest extends TransformerTestBase {
 		validateAfterAssembly(asm, List.of(DuplicateCatchMergingTransformer.class), dis -> {
 			assertEquals(1, StringUtil.count("printStackTrace", dis), "Catch block contents were not merged");
 			assertEquals(5, StringUtil.count("goto", dis), "Expected 5 goto instructions after merging");
+		});
+	}
+
+	@Test
+	void deadCodeRemovalDropsRangesContainingOnlyRemovedNops() {
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, C, * }
+				    },
+				    code: {
+				    A:
+				        nop
+				    B:
+				        return
+				    C:
+				        pop
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(DeadCodeRemovingTransformer.class), dis -> {
+			assertFalse(dis.contains("exceptions:"));
 		});
 	}
 
@@ -563,6 +587,170 @@ public class TryCatchDeobfuscationTest extends TransformerTestBase {
 		});
 	}
 
+	@Test
+	void keepDistinctUnresolvedCatchTypesOnSameRange() {
+		// If the catch types are unresolved, then we cannot make any safe transformations.
+		// Its *possible* they all share a common supertype and could be merged, but we can't know that.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, C, Lmissing/Type0; },
+				       { A, B, C, Lmissing/Type1; },
+				       { A, B, C, Lmissing/Type2; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        return
+				    C:
+				        pop
+				        return
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+	}
+
+	@Test
+	void pruneNonThrowingHandlerRangeSharedWithOtherBlock() {
+		// Tricky case where the first range can throw, and the second range shares a label with the first block's handler.
+		// We know the RuntimeException won't ever be thrown though, so it can be removed.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, C, Ljava/lang/Exception; },
+				       { C, D, E, Ljava/lang/RuntimeException; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        return
+				    C:
+				        pop // Shared instruction between the two ranges, but the second range cannot throw so it is redundant
+				    D:
+				        return
+				    E:
+				        pop
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {
+			assertTrue(dis.contains("Ljava/lang/Exception;"), "The throwing invocation still needs its handler");
+			assertFalse(dis.contains("Ljava/lang/RuntimeException;"), "A pop-only protected range cannot throw");
+		});
+	}
+
+	@Test
+	void keepNonThrowingHandlerRangeSharedWithOtherBlock() {
+		// Same test as the above, but the second block also has a throwing invocation, so it cannot be removed.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, C, Ljava/lang/Exception; },
+				       { C, D, E, Ljava/lang/RuntimeException; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        return
+				    C:
+				        pop
+				        invokestatic Example.mayThrow ()V
+				    D:
+				        return
+				    E:
+				        pop
+				        return
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+	}
+
+	@Test
+	void keepSharedHandlerAcrossDistinctProtectedRanges() {
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, H, Ljava/lang/Exception; },
+				       { B, C, H, Ljava/lang/RuntimeException; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        invokestatic Example.mayThrow ()V
+				    C:
+				        return
+				    H:
+				        athrow
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+	}
+
+	@Test
+	void keepNormallyReachableRethrowHandler() {
+		// Another edge case. The handler label is reachable from normal control flow,
+		// so we cannot remove it even though the try-catch is redundant.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { A, B, H, Ljava/lang/Exception; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        aconst_null
+				        goto H
+				    H:
+				        athrow
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+	}
+
+	@Test
+	void shadowingUsesRangeContainmentAndCatchType() {
+		// The RuntimeException handler is shadowed by the Exception handler, so it can be removed.
+		// The 'Other' handler is of a type we don't know about so we cannot remove it safely.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       { B, C, H, Ljava/lang/Exception; },
+				       { A, D, H, Ljava/lang/Exception; },
+				       { A, D, H, Ljava/lang/RuntimeException; },
+				       { A, D, H, Lmissing/Other; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Example.mayThrow ()V
+				    B:
+				        invokestatic Example.mayThrow ()V
+				    C:
+				        invokestatic Example.mayThrow ()V
+				    D:
+				        return
+				    H:
+				        pop
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {
+			assertEquals(2, StringUtil.count("Ljava/lang/Exception;", dis));
+			assertEquals(0, StringUtil.count("Ljava/lang/RuntimeException;", dis));
+			assertEquals(1, StringUtil.count("Lmissing/Other;", dis));
+		});
+	}
+
 	/** Ensures {@link RedundantTryCatchRemovingTransformer} is not too aggressive. */
 	@Test
 	void oneRedundantOneRelevantTryCatch() {
@@ -971,7 +1159,7 @@ public class TryCatchDeobfuscationTest extends TransformerTestBase {
 				    }
 				}
 				""";
-				validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
 	}
 
 	/**

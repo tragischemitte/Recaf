@@ -9,6 +9,7 @@ import jakarta.annotation.Nullable;
 import jakarta.enterprise.context.Dependent;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
+import javafx.beans.binding.Bindings;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.IntegerProperty;
 import javafx.beans.property.ObjectProperty;
@@ -37,13 +38,17 @@ import javafx.scene.control.TextField;
 import javafx.scene.control.TreeCell;
 import javafx.scene.control.TreeItem;
 import javafx.scene.control.TreeView;
+import javafx.scene.control.Tooltip;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.stage.WindowEvent;
 import me.darknet.assembler.error.Diagnostic;
 import org.kordamp.ikonli.carbonicons.CarbonIcons;
 import software.coley.observables.ObservableObject;
@@ -117,6 +122,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
@@ -141,6 +147,7 @@ public class DeobfuscationWindow extends RecafStage {
 	private final AssemblerPipelineManager assemblerPipelineManager;
 	private final ConfigComponentManager configComponentManager;
 	private final TransformationPresetManager presetManager;
+	private final FileTypeSyntaxAssociationService languageAssociation;
 	private final Actions actions;
 	private final CellConfigurationService configurationService;
 	private final WorkspaceExplorerConfig explorerConfig;
@@ -160,6 +167,7 @@ public class DeobfuscationWindow extends RecafStage {
 	private final StackPane root = new StackPane();
 	private final TransformPreview beforePreview;
 	private final TransformPreview afterPreview;
+	private Popover activeTransformerInfoPopover;
 	private TreeView<TransformerTreeNode> availableTree;
 
 	private ClassInfo previewClass;
@@ -185,6 +193,7 @@ public class DeobfuscationWindow extends RecafStage {
 		this.assemblerPipelineManager = assemblerPipelineManager;
 		this.configComponentManager = configComponentManager;
 		this.presetManager = presetManager;
+		this.languageAssociation = languageAssociation;
 		this.actions = actions;
 		this.configurationService = configurationService;
 		this.explorerConfig = explorerConfig;
@@ -199,6 +208,10 @@ public class DeobfuscationWindow extends RecafStage {
 
 		beforePreview = new TransformPreview(languageAssociation, textConfig, searchBarProvider, false);
 		afterPreview = new TransformPreview(languageAssociation, textConfig, searchBarProvider, true);
+		addEventHandler(WindowEvent.WINDOW_HIDDEN, event -> {
+			beforePreview.close();
+			afterPreview.close();
+		});
 
 		setupStage1();
 		setupStage2();
@@ -248,8 +261,11 @@ public class DeobfuscationWindow extends RecafStage {
 		title.setPadding(new Insets(0, 0, 5, 5));
 
 		availableTree = new TreeView<>(buildTransformerTree(descriptors));
+		availableTree.getStyleClass().add(Styles.DENSE);
 		availableTree.setShowRoot(false);
 		availableTree.setCellFactory(view -> new TreeCell<>() {
+			private HBox rowGraphic;
+
 			@Override
 			protected void updateItem(TransformerTreeNode item, boolean isEmpty) {
 				TransformerTreeNode oldItem = getItem();
@@ -257,6 +273,7 @@ public class DeobfuscationWindow extends RecafStage {
 				super.updateItem(item, isEmpty);
 
 				if (item == null || isEmpty) {
+					clearRowGraphic();
 					setText(null);
 					setGraphic(null);
 					return;
@@ -281,6 +298,7 @@ public class DeobfuscationWindow extends RecafStage {
 				}
 
 				if (descriptor == null) {
+					clearRowGraphic();
 					setText(item.name());
 					setGraphic(null);
 					return;
@@ -298,24 +316,61 @@ public class DeobfuscationWindow extends RecafStage {
 						deselect(descriptor);
 				});
 
-				HBox graphic = new HBox(gap, toggle);
+				Region spacer = new Region();
+				HBox.setHgrow(spacer, Priority.ALWAYS);
+				HBox graphic = new HBox(gap, toggle, new Label(descriptor.name()), spacer);
 				graphic.setAlignment(Pos.CENTER_LEFT);
+				graphic.setPadding(new Insets(0, 6, 0, 0));
 
 				if (!descriptor.parameters().isEmpty()) {
 					Button[] settingsRef = new Button[1];
 					Button settings = new ActionButton(CarbonIcons.SETTINGS, () -> showParameterEditor(descriptor, settingsRef[0]));
 					settingsRef[0] = settings;
-					settings.setPadding(new Insets(2, 4, 2, 4));
-					settings.getStyleClass().addAll(Styles.ACCENT, Styles.FLAT);
+					settings.getStyleClass().addAll(Styles.BUTTON_ICON, Styles.ACCENT, Styles.FLAT);
 					settings.disableProperty().bind(toggle.selectedProperty().not());
 					settings.setFocusTraversable(false);
-					graphic.getChildren().addAll(new Label(item.name()), settings);
+					graphic.getChildren().add(settings);
+				}
 
-					setText(null);
-					setGraphic(graphic);
-				} else {
-					setText(descriptor.name());
-					setGraphic(graphic);
+				Button[] infoRef = new Button[1];
+				ActionButton info = new ActionButton(CarbonIcons.INFORMATION, () -> showTransformerInfo(descriptor, infoRef[0]));
+				infoRef[0] = info;
+				info.getStyleClass().addAll(Styles.BUTTON_ICON, Styles.ACCENT, Styles.FLAT);
+				info.setTooltip(new Tooltip(Lang.get("deobf.info.button")));
+				info.setFocusTraversable(false);
+				graphic.getChildren().add(info);
+				setRowGraphic(graphic);
+			}
+
+			/**
+			 * Sets the row graphic for this cell and binds its width to the available tree width
+			 * minus the depth of this cell in the tree.
+			 *
+			 * @param graphic
+			 * 		Graphic to set for this cell.
+			 */
+			private void setRowGraphic(@Nonnull HBox graphic) {
+				if (rowGraphic != null)
+					rowGraphic.prefWidthProperty().unbind();
+				rowGraphic = graphic;
+				int level = 0;
+				for (TreeItem<TransformerTreeNode> treeItem = getTreeItem(); treeItem != null && treeItem.getParent() != null; treeItem = treeItem.getParent())
+					level++;
+				int treeDepth = level;
+				graphic.prefWidthProperty().bind(Bindings.createDoubleBinding(
+						() -> Math.max(0, availableTree.getWidth() - 16 - treeDepth * 18),
+						availableTree.widthProperty()));
+				setText(null);
+				setGraphic(graphic);
+			}
+
+			/**
+			 * Clears the row graphic for this cell and unbinds its width property.
+			 */
+			private void clearRowGraphic() {
+				if (rowGraphic != null) {
+					rowGraphic.prefWidthProperty().unbind();
+					rowGraphic = null;
 				}
 			}
 		});
@@ -365,6 +420,8 @@ public class DeobfuscationWindow extends RecafStage {
 		orderPane.setTop(new BoundLabel(Lang.getBinding("deobf.order.title")));
 		orderPane.setCenter(orderList);
 		orderPane.setBottom(actions);
+		((Region) availablePane.getTop()).setPadding(new Insets(0, 0, 10, 1));
+		((Region) orderPane.getTop()).setPadding(new Insets(0, 0, 10, 1));
 
 		HBox split = new HBox(availablePane, orderPane);
 		split.setSpacing(8);
@@ -372,6 +429,7 @@ public class DeobfuscationWindow extends RecafStage {
 		HBox.setHgrow(availablePane, javafx.scene.layout.Priority.ALWAYS);
 		HBox.setHgrow(orderPane, javafx.scene.layout.Priority.ALWAYS);
 
+		stage1Pane.setPadding(new Insets(4));
 		stage1Pane.setTop(title);
 		stage1Pane.setCenter(split);
 	}
@@ -737,6 +795,98 @@ public class DeobfuscationWindow extends RecafStage {
 		for (TransformationParameter<?> parameter : descriptor.parameters())
 			values.put(parameter.key(), parameter.defaultValue());
 		return values;
+	}
+
+	/**
+	 * Opens a documentation popover for the given transformer.
+	 *
+	 * @param descriptor
+	 * 		Transformer descriptor whose documentation to display.
+	 * @param anchor
+	 * 		Node to anchor the popover to.
+	 */
+	private void showTransformerInfo(@Nonnull TransformerDescriptor descriptor, @Nonnull Node anchor) {
+		if (activeTransformerInfoPopover != null)
+			activeTransformerInfoPopover.hide();
+
+		List<Editor> editors = new ArrayList<>();
+		Pane content = buildTransformerInfoContent(descriptor, editors);
+		content.setMaxWidth(600);
+		content.setMaxHeight(560);
+
+		Popover popover = new Popover(content);
+		popover.setArrowLocation(Popover.ArrowLocation.BOTTOM_RIGHT);
+		popover.setAutoHide(true);
+		popover.addEventFilter(WindowEvent.WINDOW_HIDDEN, event -> {
+			for (Editor editor : editors)
+				editor.close();
+			if (activeTransformerInfoPopover == popover)
+				activeTransformerInfoPopover = null;
+		});
+		activeTransformerInfoPopover = popover;
+		popover.show(anchor);
+	}
+
+	/**
+	 * Builds the documentation content for a transformer.
+	 *
+	 * @param descriptor
+	 * 		Transformer descriptor whose documentation to display.
+	 * @param editors
+	 * 		List to populate with example editors for cleanup when the popover closes.
+	 *
+	 * @return Documentation content node.
+	 */
+	@Nonnull
+	private Pane buildTransformerInfoContent(@Nonnull TransformerDescriptor descriptor, @Nonnull List<Editor> editors) {
+		VBox content = new VBox(8);
+		content.setPadding(new Insets(10));
+		content.setMaxWidth(Double.MAX_VALUE);
+
+		Label name = new Label(descriptor.name());
+		name.getStyleClass().add(Styles.TITLE_4);
+		String descriptionKey = descriptor.instance().descriptionKey();
+		String descriptionText = Lang.has(descriptionKey) ? Lang.get(descriptionKey) : Lang.get("deobf.info.missing");
+		Label description = new Label(descriptionText);
+		description.setWrapText(true);
+		description.setMaxWidth(Double.MAX_VALUE);
+		content.getChildren().addAll(name, description);
+
+		String beforeExample = descriptor.instance().beforeExample();
+		if (beforeExample != null && !beforeExample.isBlank()) {
+			content.getChildren().add(new BoundLabel(Lang.getBinding("deobf.info.before")));
+			Editor editor = buildJavaEditor(beforeExample);
+			editors.add(editor);
+			content.getChildren().add(editor);
+		}
+
+		String afterExample = descriptor.instance().afterExample();
+		if (afterExample != null && !afterExample.isBlank()) {
+			content.getChildren().add(new BoundLabel(Lang.getBinding("deobf.info.after")));
+			Editor editor = buildJavaEditor(afterExample);
+			editors.add(editor);
+			content.getChildren().add(editor);
+		}
+
+		return content;
+	}
+
+	/**
+	 * @param code
+	 * 		Java code to display in the editor.
+	 *
+	 * @return Read-only Java editor.
+	 */
+	@Nonnull
+	private Editor buildJavaEditor(@Nonnull String code) {
+		Editor editor = new Editor();
+		editor.setText(code);
+		editor.getCodeArea().setEditable(false);
+		languageAssociation.configureEditorSyntax("java", editor);
+		editor.setPrefHeight(140);
+		editor.setPrefWidth(500);
+		editor.getStyleClass().add(Styles.BORDER_DEFAULT);
+		return editor;
 	}
 
 	/**
@@ -1221,8 +1371,10 @@ public class DeobfuscationWindow extends RecafStage {
 	 * Preview pane capable of disassembly/decompilation for both before and after states.
 	 */
 	private class TransformPreview extends BorderPane {
-		private final Batch deobfuscationBatch = ThreadUtil.batch(ThreadPoolFactory.newSingleThreadExecutor("deobfuscation-preview"));
+		private final ExecutorService deobfuscationExecutor = ThreadPoolFactory.newSingleThreadExecutor("deobfuscation-preview");
+		private final Batch deobfuscationBatch = ThreadUtil.batch(deobfuscationExecutor);
 		private final AtomicInteger previewGeneration = new AtomicInteger();
+		private boolean closed;
 		private final boolean andApply;
 		private final Editor editorDecompile;
 		private final Editor editorAssembly;
@@ -1302,7 +1454,10 @@ public class DeobfuscationWindow extends RecafStage {
 		/**
 		 * Queues a preview refresh, coalescing rapid profile changes into the latest build.
 		 */
-		private void updatePreview() {
+		private synchronized void updatePreview() {
+			if (closed)
+				return;
+
 			// TODO: We can't really stop expensive decompilations, they don't check for interrupts on the current thread
 			//  and we have no good way of force killing them (rip Thread.stop) so the best we can really do is only
 			//  allow one of these tasks to run at a time, with one next 'pending' task.
@@ -1317,6 +1472,21 @@ public class DeobfuscationWindow extends RecafStage {
 					disassemble(generation);
 			});
 			deobfuscationBatch.executeNewest();
+		}
+
+		/**
+		 * Stops preview work and releases resources after closing.
+		 */
+		private synchronized void close() {
+			if (closed)
+				return;
+
+			closed = true;
+			previewGeneration.incrementAndGet();
+			deobfuscationBatch.clear();
+			deobfuscationExecutor.shutdownNow();
+			editorDecompile.close();
+			editorAssembly.close();
 		}
 
 		/**

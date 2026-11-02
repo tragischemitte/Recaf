@@ -95,9 +95,9 @@ import software.coley.recaf.ui.pane.search.InstructionSearchPane;
 import software.coley.recaf.ui.pane.search.MemberDeclarationSearchPane;
 import software.coley.recaf.ui.pane.search.MemberReferenceSearchPane;
 import software.coley.recaf.ui.pane.search.NumberSearchPane;
+import software.coley.recaf.ui.pane.search.SearchResultsPane;
 import software.coley.recaf.ui.pane.search.SimilarClassTablePane;
 import software.coley.recaf.ui.pane.search.SimilarMethodTablePane;
-import software.coley.recaf.ui.pane.search.SearchResultsPane;
 import software.coley.recaf.ui.pane.search.StringSearchPane;
 import software.coley.recaf.ui.pane.search.StringTablePane;
 import software.coley.recaf.util.Animations;
@@ -266,32 +266,40 @@ public class Actions implements Service {
 	 */
 	@Nonnull
 	public Navigable gotoDeclaration(@Nonnull PathNode<?> path) throws IncompletePathException {
-		if (path instanceof ClassPathNode classPath) return gotoDeclaration(classPath);
-		else if (path instanceof FilePathNode filePath) return gotoDeclaration(filePath);
-		else if (path instanceof ClassMemberPathNode classMemberPath) {
-			ClassPathNode parent = classMemberPath.getParent();
-			if (parent == null)
-				throw new IncompletePathException(ClassInfo.class);
-			ClassNavigable navigable = gotoDeclaration(parent);
-			navigable.requestFocus(classMemberPath.getValue());
-			return navigable;
-		} else if (path instanceof LocalVariablePathNode variablePath) {
-			ClassMemberPathNode parent = variablePath.getParent();
-			if (parent == null)
-				throw new IncompletePathException(ClassMember.class);
-			ClassPathNode classPath = parent.getParent();
-			if (classPath == null)
-				throw new IncompletePathException(ClassInfo.class);
-			ClassNavigable navigable = gotoDeclaration(classPath);
-			navigable.requestFocus(parent.getValue());
-			return navigable;
-		} else if (path instanceof LineNumberPathNode lineNumberPath) {
-			FilePathNode parent = lineNumberPath.getParent();
-			if (parent == null)
-				throw new IncompletePathException(FileInfo.class);
-			return gotoDeclaration(parent);
+		switch (path) {
+			case ClassPathNode classPath -> {
+				return gotoDeclaration(classPath);
+			}
+			case FilePathNode filePath -> {
+				return gotoDeclaration(filePath);
+			}
+			case ClassMemberPathNode classMemberPath -> {
+				ClassPathNode parent = classMemberPath.getParent();
+				if (parent == null)
+					throw new IncompletePathException(ClassInfo.class);
+				ClassNavigable navigable = gotoDeclaration(parent);
+				navigable.requestFocus(classMemberPath.getValue());
+				return navigable;
+			}
+			case LocalVariablePathNode variablePath -> {
+				ClassMemberPathNode parent = variablePath.getParent();
+				if (parent == null)
+					throw new IncompletePathException(ClassMember.class);
+				ClassPathNode classPath = parent.getParent();
+				if (classPath == null)
+					throw new IncompletePathException(ClassInfo.class);
+				ClassNavigable navigable = gotoDeclaration(classPath);
+				navigable.requestFocus(parent.getValue());
+				return navigable;
+			}
+			case LineNumberPathNode lineNumberPath -> {
+				FilePathNode parent = lineNumberPath.getParent();
+				if (parent == null)
+					throw new IncompletePathException(FileInfo.class);
+				return gotoDeclaration(parent);
+			}
+			default -> throw new IncompletePathException(path.getValueType());
 		}
-		throw new IncompletePathException(path.getValueType());
 	}
 
 	/**
@@ -513,6 +521,34 @@ public class Actions implements Service {
 			setupInfoContextMenu(info, content, dockable, menu -> addFilePaneOptions(menu, content));
 			return dockable;
 		});
+	}
+
+
+	/**
+	 * Prompts the user to document the class or member contained in the given path.
+	 *
+	 * @param path
+	 * 		Path to a class or member to document.
+	 */
+	public void openCommentEditing(@Nonnull PathNode<?> path) {
+		Workspace workspace = path.getValueOfType(Workspace.class);
+		WorkspaceResource resource = path.getValueOfType(WorkspaceResource.class);
+		ClassBundle<?> bundle = path.getValueOfType(ClassBundle.class);
+		if (workspace == null || resource == null || bundle == null) {
+			logger.error("Cannot open comment editor for path '{}', missing workspace, resource, or class bundle", path);
+			return;
+		}
+
+		if (path instanceof ClassPathNode classPath) {
+			openCommentEditing(workspace, resource, bundle, classPath.getValue());
+		} else if (path instanceof ClassMemberPathNode memberPath) {
+			ClassInfo declaringClass = memberPath.getValueOfType(ClassInfo.class);
+			if (declaringClass == null) {
+				logger.error("Cannot open comment editor for member path '{}', missing declaring class", path);
+				return;
+			}
+			openCommentEditing(workspace, resource, bundle, declaringClass, memberPath.getValue());
+		}
 	}
 
 	/**
@@ -1833,10 +1869,12 @@ public class Actions implements Service {
 	                          @Nullable String packageName) {
 		JvmClassBundle bundleCopy = new BasicJvmClassBundle();
 		bundle.valuesAsCopy().forEach(cls -> {
-			if (packageName == null && cls.getPackageName() == null)
+			if (packageName == null || packageName.isEmpty()) {
+				if (cls.getPackageName() == null)
+					bundleCopy.put(cls);
+			} else if (cls.getName().startsWith(packageName + "/")) {
 				bundleCopy.put(cls);
-			else if (cls.getName().startsWith(packageName + "/"))
-				bundleCopy.put(cls);
+			}
 		});
 		WorkspaceResource resourceCopy = new WorkspaceResourceBuilder().withJvmClassBundle(bundleCopy).build();
 		Workspace workspaceCopy = new BasicWorkspace(resourceCopy);
@@ -1933,11 +1971,13 @@ public class Actions implements Service {
 	                            @Nonnull FileBundle bundle,
 	                            @Nullable String directoryName) {
 		FileBundle bundleCopy = new BasicFileBundle();
-		bundle.valuesAsCopy().forEach(cls -> {
-			if (directoryName == null && cls.getDirectoryName() == null)
-				bundleCopy.put(cls);
-			else if (cls.getName().startsWith(directoryName + "/"))
-				bundleCopy.put(cls);
+		bundle.valuesAsCopy().forEach(file -> {
+			if (directoryName == null || directoryName.isEmpty()) {
+				if (file.getDirectoryName() == null)
+					bundleCopy.put(file);
+			} else if (file.getName().startsWith(directoryName + "/")) {
+				bundleCopy.put(file);
+			}
 		});
 		WorkspaceResource resourceCopy = new WorkspaceResourceBuilder().withFileBundle(bundleCopy).build();
 		Workspace workspaceCopy = new BasicWorkspace(resourceCopy);

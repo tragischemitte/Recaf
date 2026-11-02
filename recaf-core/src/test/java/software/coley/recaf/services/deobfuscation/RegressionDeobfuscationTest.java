@@ -48,7 +48,7 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			.class public super Example {
 			    .field static keys [I
 			    .field static sink I
-
+			
 			    .method static <clinit> ()V {
 			        code: {
 			        A:
@@ -59,7 +59,7 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			        B:
 			        }
 			    }
-
+			
 			    .method static record (I)V {
 			        parameters: { value },
 			        code: {
@@ -70,7 +70,7 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			        B:
 			        }
 			    }
-
+			
 			    .method static arrayStore ()I {
 			        code: {
 			        A:
@@ -89,7 +89,7 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			        B:
 			        }
 			    }
-
+			
 			    .method static fieldStore ()I {
 			        code: {
 			        A:
@@ -104,7 +104,7 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			        B:
 			        }
 			    }
-
+			
 			    .method static argumentCall ()I {
 			        code: {
 			        A:
@@ -684,6 +684,34 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 		validateNoTransformation(asm, List.of(CallResultInliningTransformer.class));
 	}
 
+	@Test
+	@Timeout(5)
+	void callInliningRecursiveCycle() {
+		// If this runs for 5+ seconds we know we have a recursive call inlining issue.
+		String asm = """
+				.super java/lang/Object
+				.class Example {
+				    .method public static recurse ()I {
+				        code: {
+				        A:
+				            invokestatic Example.recurse ()I
+				            ireturn
+				        B:
+				        }
+				    }
+				    .method public static caller ()I {
+				        code: {
+				        A:
+				            invokestatic Example.recurse ()I
+				            ireturn
+				        B:
+				        }
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(CallResultInliningTransformer.class));
+	}
+
 	/**
 	 * This case has "xyz" always be "1" when read, so it should fold.
 	 */
@@ -820,6 +848,55 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 			assertTrue(RegexUtil.matchesAny("E:\\s+iconst_3\\s+ireturn", dis), "E block should fold to iconst_3");
 			assertTrue(RegexUtil.matchesAny("D:\\s+//.+\\s+pop\\s+iload xyz\\s+ireturn", dis), "D block shouldn't fold since it can be 0, 1, or 2");
 		});
+	}
+
+	/**
+	 * A handler can be reached both before and after a redundant copy store. The handler load must keep using
+	 * the target local because the source local is not initialized on the pre-store exception path.
+	 */
+	@Test
+	void variableFoldingDoesNotUseCopySourceAcrossBypassExceptionPath() {
+		compileFull("Example", """
+				class Example {
+				    static String create(boolean shouldThrow) {
+				        if (shouldThrow) throw new IllegalStateException();
+				        return "source";
+				    }
+				    static void maybeThrow(boolean shouldThrow) {
+				        if (shouldThrow) throw new IllegalStateException();
+				    }
+				    static String throwBeforeCopy() {
+				        String copy = null;
+				        try {
+				            String source = create(true);
+				            copy = source;
+				            maybeThrow(false);
+				        } catch (IllegalStateException ignored) {
+				            return copy;
+				        }
+				        return copy;
+				    }
+				    static String throwAfterCopy() {
+				        String copy = null;
+				        try {
+				            String source = create(false);
+				            copy = source;
+				            maybeThrow(true);
+				        } catch (IllegalStateException ignored) {
+				            return copy;
+				        }
+				        return copy;
+				    }
+				}
+				""");
+
+		assertNull(invokeStatic("Example", "throwBeforeCopy", "Example"));
+		assertEquals("source", invokeStatic("Example", "throwAfterCopy", "Example"));
+
+		transformAndApply(List.of(VariableFoldingTransformer.class));
+
+		assertNull(invokeStatic("Example", "throwBeforeCopy", "Example"));
+		assertEquals("source", invokeStatic("Example", "throwAfterCopy", "Example"));
 	}
 
 	/**
@@ -2169,37 +2246,37 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 	@Test
 	void constantFoldingKeepsVoidStaticCallBetweenOperands() {
 		assemble("""
-			.super java/lang/Object
-			.class public super Example {
-			    .field static hits I
-
-			    .method static setupXorKeys ()V {
-			        code: {
-			        A:
-			            getstatic Example.hits I
-			            iconst_1
-			            iadd
-			            putstatic Example.hits I
-			            return
-			        B:
-			        }
-			    }
-
-			    .method static run ()I {
-			        code: {
-			        A:
-			            iconst_1
-			            iconst_1
-			            invokestatic Example.setupXorKeys ()V
-			            iadd
-			            getstatic Example.hits I
-			            iadd
-			            ireturn
-			        B:
-			        }
-			    }
-			}
-			""", true);
+				.super java/lang/Object
+				.class public super Example {
+				    .field static hits I
+				
+				    .method static setupXorKeys ()V {
+				        code: {
+				        A:
+				            getstatic Example.hits I
+				            iconst_1
+				            iadd
+				            putstatic Example.hits I
+				            return
+				        B:
+				        }
+				    }
+				
+				    .method static run ()I {
+				        code: {
+				        A:
+				            iconst_1
+				            iconst_1
+				            invokestatic Example.setupXorKeys ()V
+				            iadd
+				            getstatic Example.hits I
+				            iadd
+				            ireturn
+				        B:
+				        }
+				    }
+				}
+				""", true);
 		assertEquals(3, invokeStatic("Example", "run", "Example"));
 		transformAndApply(List.of(OpaqueConstantFoldingTransformer.class));
 		assertEquals(3, invokeStatic("Example", "run", "Example"));
@@ -2211,39 +2288,39 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 	@Test
 	void constantFoldingKeepsPoppedStaticCallBetweenOperands() {
 		assemble("""
-			.super java/lang/Object
-			.class public super Example {
-			    .field static count I
-
-			    .method static next ()I {
-			        code: {
-			        A:
-			            getstatic Example.count I
-			            iconst_1
-			            iadd
-			            dup
-			            putstatic Example.count I
-			            ireturn
-			        B:
-			        }
-			    }
-
-			    .method static run ()I {
-			        code: {
-			        A:
-			            iconst_1
-			            invokestatic Example.next ()I
-			            pop
-			            iconst_1
-			            iadd
-			            getstatic Example.count I
-			            iadd
-			            ireturn
-			        B:
-			        }
-			    }
-			}
-			""", true);
+				.super java/lang/Object
+				.class public super Example {
+				    .field static count I
+				
+				    .method static next ()I {
+				        code: {
+				        A:
+				            getstatic Example.count I
+				            iconst_1
+				            iadd
+				            dup
+				            putstatic Example.count I
+				            ireturn
+				        B:
+				        }
+				    }
+				
+				    .method static run ()I {
+				        code: {
+				        A:
+				            iconst_1
+				            invokestatic Example.next ()I
+				            pop
+				            iconst_1
+				            iadd
+				            getstatic Example.count I
+				            iadd
+				            ireturn
+				        B:
+				        }
+				    }
+				}
+				""", true);
 		assertEquals(3, invokeStatic("Example", "run", "Example"));
 		transformAndApply(List.of(OpaqueConstantFoldingTransformer.class));
 		assertEquals(3, invokeStatic("Example", "run", "Example"));
@@ -2341,6 +2418,24 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 		assertEquals(42, invokeStatic("SlotGap", "run", "SlotGap"));
 		transformAndApply(List.of(VariableTableNormalizingTransformer.class));
 		assertEquals(42, invokeStatic("SlotGap", "run", "SlotGap"));
+	}
+
+	/** Normalization shouldn't change abstract/native methods, which have no code and thus no variable table. */
+	@Test
+	void variableTableNormalizingSkipsCodeLessMethods() {
+		compileFull("AbstractMethods", """
+				interface AbstractMethods {
+					void invoke(String text, long count);
+				}
+				""");
+		compileFull("NativeMethods", """
+				class NativeMethods {
+					native void invoke(String text, long count);
+				}
+				""");
+		JvmTransformResult result = assertDoesNotThrow(() -> newApplier().transformJvm(List.of(VariableTableNormalizingTransformer.class)));
+		assertTrue(result.getTransformerFailures().isEmpty(), "There were transformation failures");
+		assertTrue(result.getTransformedClasses().isEmpty(), "Abstract methods should not be normalized");
 	}
 
 	/**

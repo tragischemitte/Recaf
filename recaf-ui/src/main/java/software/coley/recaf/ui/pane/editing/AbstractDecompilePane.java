@@ -21,8 +21,8 @@ import software.coley.observables.ObservableObject;
 import software.coley.recaf.analytics.logging.Logging;
 import software.coley.recaf.info.AndroidClassInfo;
 import software.coley.recaf.info.ClassInfo;
-import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.info.InnerClassInfo;
+import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.info.member.ClassMember;
 import software.coley.recaf.info.properties.builtin.RemapOriginTaskProperty;
 import software.coley.recaf.path.ClassPathNode;
@@ -159,6 +159,11 @@ public class AbstractDecompilePane extends BorderPane implements ClassNavigable,
 				AstResolveResult result = contextActionSupport.resolvePosition(editor.getCodeArea().getCaretPosition());
 				if (result != null)
 					actions.rename(result.path());
+			} else if (keys.getComment().match(e)) {
+				// Resolve what the caret position has, then handle comment editing on the generic result.
+				AstResolveResult result = contextActionSupport.resolvePosition(editor.getCodeArea().getCaretPosition());
+				if (result != null)
+					actions.openCommentEditing(result.path());
 			} else if (keys.getGoto().match(e)) {
 				// Resolve what the caret position has, then handle navigating to the resulting path.
 				AstResolveResult result = contextActionSupport.resolvePosition(editor.getCodeArea().getCaretPosition());
@@ -364,6 +369,13 @@ public class AbstractDecompilePane extends BorderPane implements ClassNavigable,
 		Workspace workspace = path.getValueOfType(Workspace.class);
 		JvmClassInfo classInfo = path.getValue().asJvmClass();
 
+		// Get current caret position so we can restore prior positions between decompilations.
+		// Some actions that edit the class (like mapping, assembler edits, etc) will decompile with some changes,
+		// so the actual position may drift a bit, but it's better than nothing. Can improve later if it's a problem.
+		CodeArea area = editor.getCodeArea();
+		int caretParagraph = area.getCurrentParagraph();
+		int caretColumn = area.getCaretColumn();
+
 		// Schedule decompilation task, update the editor's text asynchronously on the JavaFX UI thread when complete.
 		decompileInProgress.setValue(true);
 		editor.setMouseTransparent(true);
@@ -376,7 +388,7 @@ public class AbstractDecompilePane extends BorderPane implements ClassNavigable,
 					// Handle uncaught exceptions
 					if (throwable != null) {
 						String trace = StringUtil.traceToString(throwable);
-						editor.setText("/*\nUncaught exception when decompiling:\n" + trace + "\n*/");
+						editor.setTextAndCaret("/*\nUncaught exception when decompiling:\n" + trace + "\n*/", caretParagraph, caretColumn);
 						return;
 					}
 
@@ -387,15 +399,15 @@ public class AbstractDecompilePane extends BorderPane implements ClassNavigable,
 					DecompileResult.ResultType resultType = result.getType();
 					decompileOutputErrored.setValue(resultType == DecompileResult.ResultType.FAILURE);
 					switch (resultType) {
-						case SUCCESS -> editor.setText(text);
-						case SKIPPED -> editor.setText(text == null ? "// Decompilation skipped" : text);
+						case SUCCESS -> editor.setTextAndCaret(text, caretParagraph, caretColumn);
+						case SKIPPED -> editor.setTextAndCaret(text == null ? "// Decompilation skipped" : text, caretParagraph, caretColumn);
 						case FAILURE -> {
 							Throwable exception = result.getException();
 							if (exception != null) {
 								String trace = StringUtil.traceToString(exception);
-								editor.setText("/*\nDecompile failed:\n" + trace + "\n*/");
+								editor.setTextAndCaret("/*\nDecompile failed:\n" + trace + "\n*/", caretParagraph, caretColumn);
 							} else {
-								editor.setText("/*\nDecompile failed, but no trace was attached.\n*/");
+								editor.setTextAndCaret("/*\nDecompile failed, but no trace was attached.\n*/", caretParagraph, caretColumn);
 							}
 						}
 					}
